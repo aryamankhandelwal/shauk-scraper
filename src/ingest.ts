@@ -21,6 +21,44 @@ function isKidsProduct(item: Pick<Item, "title" | "product_url">): boolean {
   return false;
 }
 
+// Gender validation patterns — mirror of shauk-api/app/api/lib/classifier.ts
+// SYNC: keep these patterns aligned with shauk-api/app/api/lib/classifier.ts
+const GENDER_MALE_PATTERNS = [
+  /\bmen\b/, /\bmens\b/, /\bmen's\b/, /\bsherwani\b/, /\bkurta\s+for\s+men\b/,
+  /\bpathani\b/, /\bnehru\b/, /\bbandhgala\b/,
+  /\bkurta\s+pajama\b/, /\bkurta\s+churidar\b/,
+];
+const GENDER_FEMALE_PATTERNS = [
+  /\bwomen\b/, /\bwomens\b/, /\bwomen's\b/, /\bkurti\b/, /\blehenga\b/,
+  /\bsaree\b/, /\bsari\b/, /\banarkali\b/, /\bsalwar\b/, /\bdupatta\b/,
+  /\bstraight\s+kurta\b/, /\bpalazzo\b/, /\ba[\s-]line\b/, /\bpeplum\b/, /\bkurta\s+pant\b/,
+];
+const GENDER_MALE_URL_SEGMENTS = ["/men/", "/men-", "-men/", "/menswear", "/mens/"];
+const GENDER_FEMALE_URL_SEGMENTS = ["/women/", "/women-", "-women/", "/womenswear", "/womens/"];
+
+function classifyForIngest(item: Pick<Item, "title" | "product_url">): "male" | "female" | "unknown" {
+  const url = item.product_url.toLowerCase();
+  const text = (item.title + " " + url).toLowerCase();
+  if (GENDER_FEMALE_URL_SEGMENTS.some((s) => url.includes(s))) return "female";
+  if (GENDER_MALE_URL_SEGMENTS.some((s) => url.includes(s))) return "male";
+  if (GENDER_MALE_PATTERNS.some((p) => p.test(text))) return "male";
+  if (GENDER_FEMALE_PATTERNS.some((p) => p.test(text))) return "female";
+  return "unknown";
+}
+
+/**
+ * Validates the intended gender tag against signals in the item's title and URL.
+ * If the classifier confidently detects the opposite gender, the tag is overridden.
+ */
+function validateGender(item: Pick<Item, "title" | "product_url">, intendedGender: ItemGender): ItemGender {
+  const detected = classifyForIngest(item);
+  if (detected !== "unknown" && detected !== intendedGender) {
+    console.log(`[gender-override] "${item.title}" → tagged as ${detected} (overriding ${intendedGender})`);
+    return detected as ItemGender;
+  }
+  return intendedGender;
+}
+
 async function main() {
   const query = process.argv[2];
   const genderArg = process.argv[3];
@@ -60,7 +98,10 @@ async function main() {
 
   results.forEach((result, i) => {
     if (result.status === "fulfilled") {
-      const tagged: Item[] = result.value.map((item) => ({ ...item, gender }));
+      const tagged: Item[] = result.value.map((item) => ({
+        ...item,
+        gender: validateGender(item, gender),
+      }));
       console.log(`${labels[i]}: ${tagged.length} products`);
       allItems.push(...tagged);
     } else {
