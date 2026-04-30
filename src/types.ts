@@ -6,5 +6,5 @@ export interface Item {
   image_url: string;
   product_url: string;
   source: "myntra" | "nykaa" | "manish_malhotra";
-  gender: ItemGender;
+  gender?: ItemGender;
 }
