@@ -7,4 +7,9 @@ export interface Item {
   product_url: string;
   source: "myntra" | "nykaa" | "manish_malhotra";
   gender?: ItemGender;
+  garment_type?: string | null;
+  color?: string | null;
+  fabric?: string | null;
+  embellishments?: string[];
+  currency?: string;
 }

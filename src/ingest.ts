@@ -4,6 +4,7 @@ import { scrapeNykaa } from "./scrapers/nykaa";
 import { scrapeManish } from "./scrapers/manish";
 import { supabase } from "./lib/supabase";
 import { Item, ItemGender } from "./types";
+import { extractMetadata } from "./lib/metadata";
 
 // Kids signals — filter at ingest time so they never enter the database
 const KIDS_PATTERNS = [
@@ -98,10 +99,23 @@ async function main() {
 
   results.forEach((result, i) => {
     if (result.status === "fulfilled") {
-      const tagged: Item[] = result.value.map((item) => ({
-        ...item,
-        gender: validateGender(item, gender),
-      }));
+      const tagged: Item[] = result.value.map((item) => {
+        const meta = extractMetadata(item.title);
+        return {
+          ...item,
+          gender:         validateGender(item, gender),
+          garment_type:   item.garment_type ?? meta.garmentType,
+          color:          item.color        ?? meta.color,
+          fabric:         item.fabric       ?? meta.fabric,
+          embellishments: [
+            ...(item.embellishments ?? []),
+            ...meta.embellishments.filter(
+              (e) => !(item.embellishments ?? []).includes(e)
+            ),
+          ],
+          currency:       item.currency ?? meta.currency,
+        };
+      });
       console.log(`${labels[i]}: ${tagged.length} products`);
       allItems.push(...tagged);
     } else {

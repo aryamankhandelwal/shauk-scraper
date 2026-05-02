@@ -9,6 +9,35 @@ import {
 
 const COLLECTION_URL = "https://www.manishmalhotra.in/collections/all";
 
+interface PdpEnrichment {
+  color: string | null;
+  fabric: string | null;
+}
+
+async function enrichFromPdp(
+  browser: import("puppeteer").Browser,
+  productUrl: string
+): Promise<PdpEnrichment> {
+  const page = await createStealthPage(browser);
+  try {
+    await page.goto(productUrl, { waitUntil: "networkidle2", timeout: 15000 });
+    return await page.evaluate(() => {
+      const body = document.body.innerText;
+      const colourMatch = body.match(/colou?r[:\s]+([^\n,]+)/i);
+      const fabricMatch = body.match(/fabric[:\s]+([^\n,]+)/i);
+      return {
+        color:  colourMatch ? colourMatch[1].trim().toLowerCase() : null,
+        fabric: fabricMatch ? fabricMatch[1].trim().toLowerCase() : null,
+      };
+    });
+  } catch (err) {
+    console.warn(`[manish] PDP enrichment failed for ${productUrl}:`, (err as Error).message);
+    return { color: null, fabric: null };
+  } finally {
+    await page.close();
+  }
+}
+
 export async function scrapeManish(): Promise<Item[]> {
   const browser = await launchBrowser();
   try {
@@ -37,7 +66,8 @@ export async function scrapeManish(): Promise<Item[]> {
         );
 
         return {
-          title: titleEl?.textContent?.trim() ?? "",
+          // Prefer img.alt — Shopify cards have full untruncated title there
+          title: img?.getAttribute("alt")?.trim() || titleEl?.textContent?.trim() || "",
           priceText: priceEl?.textContent?.trim() ?? "",
           imgSrc: img?.getAttribute("src") ?? "",
           imgSrcset: img?.getAttribute("srcset") ?? "",
@@ -46,7 +76,8 @@ export async function scrapeManish(): Promise<Item[]> {
       });
     });
 
-    const items: Item[] = [];
+    // Build base items from collection page
+    const baseItems: Item[] = [];
     for (const r of raw) {
       const imageUrl = bestImageUrl(r.imgSrcset || null, r.imgSrc);
       if (!imageUrl || isJunkImage(imageUrl)) continue;
@@ -58,7 +89,7 @@ export async function scrapeManish(): Promise<Item[]> {
 
       if (!r.title || !productUrl.includes("/products/")) continue;
 
-      items.push({
+      baseItems.push({
         title: r.title,
         price,
         image_url: imageUrl.startsWith("//") ? `https:${imageUrl}` : imageUrl,
@@ -66,7 +97,18 @@ export async function scrapeManish(): Promise<Item[]> {
         source: "manish_malhotra",
       });
 
-      if (items.length >= 4) break;
+      if (baseItems.length >= 4) break;
+    }
+
+    // PDP enrichment — sequential to avoid anti-bot triggers
+    const items: Item[] = [];
+    for (const item of baseItems) {
+      const { color, fabric } = await enrichFromPdp(browser, item.product_url);
+items.push({
+        ...item,
+        ...(color  ? { color }  : {}),
+        ...(fabric ? { fabric } : {}),
+      });
     }
 
     return items;
