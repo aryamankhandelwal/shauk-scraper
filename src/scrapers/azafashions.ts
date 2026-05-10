@@ -14,8 +14,8 @@ export async function scrapeAzaFashions(_query: string): Promise<Item[]> {
   try {
     const items: Item[] = [];
     for (const url of [WOMEN_URL, MEN_URL]) {
-      if (items.length >= 10) break;
-      const pageItems = await scrapePage(browser, url, 5);
+      if (items.length >= 60) break;
+      const pageItems = await scrapePage(browser, url, 30);
       items.push(...pageItems);
     }
     return items;

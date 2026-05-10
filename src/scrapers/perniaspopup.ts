@@ -42,7 +42,7 @@ export async function scrapePerniasPopup(_query: string): Promise<Item[]> {
 
     // If API interception got products, return those
     if (intercepted.length > 0) {
-      return intercepted.slice(0, 10);
+      return intercepted.slice(0, 30);
     }
 
     // Otherwise try DOM scraping
@@ -74,11 +74,11 @@ export async function scrapePerniasPopup(_query: string): Promise<Item[]> {
         });
       }
       return results;
-    }, 10);
+    }, 30);
 
     const items: Item[] = [];
     for (const r of raw) {
-      if (items.length >= 10) break;
+      if (items.length >= 30) break;
       if (!r.title || !r.href) continue;
       const imageUrl = bestImageUrl(r.imgSrcset || null, r.imgSrc);
       if (!imageUrl || isJunkImage(imageUrl)) continue;

@@ -44,6 +44,7 @@ const GENDER_FEMALE_PATTERNS = [
   /\bwomen\b/, /\bwomens\b/, /\bwomen's\b/, /\bkurti\b/, /\blehenga\b/,
   /\bsaree\b/, /\bsari\b/, /\banarkali\b/, /\bsalwar\b/, /\bdupatta\b/,
   /\bstraight\s+kurta\b/, /\bpalazzo\b/, /\ba[\s-]line\b/, /\bpeplum\b/, /\bkurta\s+pant\b/,
+  /\bkurta\s+set\b/, /\bsharara\b/, /\bgharara\b/,
 ];
 const GENDER_MALE_URL_SEGMENTS = ["/men/", "/men-", "-men/", "/menswear", "/mens/"];
 const GENDER_FEMALE_URL_SEGMENTS = ["/women/", "/women-", "-women/", "/womenswear", "/womens/"];
@@ -254,6 +255,19 @@ async function main() {
     ]);
     allItems = [...shopifyItems, ...jsonldItems];
 
+  } else if (mode === "puppeteer") {
+    // Ingest only the Puppeteer registry sites (no browser for Shopify/JSON-LD)
+    console.log("=== INGESTING PUPPETEER REGISTRY SITES ===\n");
+    const puppeteerSites = SITE_REGISTRY.filter(
+      (s): s is PuppeteerConfig => s.type === "puppeteer"
+    );
+    const puppeteerItems: Item[] = [];
+    for (const site of puppeteerSites) {
+      const items = await ingestPuppeteerSite(site, "ethnic wear");
+      puppeteerItems.push(...items);
+    }
+    allItems = puppeteerItems;
+
   } else if (mode === "all") {
     // Ingest all sites from registry
     console.log("=== INGESTING ALL SITES ===\n");
@@ -285,7 +299,8 @@ async function main() {
     if (!query) {
       console.error("Usage:");
       console.error('  npm run ingest -- <query> <gender>     (legacy mode)');
-      console.error('  npm run ingest -- shopify               (all Shopify sites)');
+      console.error('  npm run ingest -- shopify               (all Shopify + JSON-LD sites)');
+      console.error('  npm run ingest -- puppeteer             (all Puppeteer registry sites)');
       console.error('  npm run ingest -- all                   (all registry sites)');
       process.exit(1);
     }
