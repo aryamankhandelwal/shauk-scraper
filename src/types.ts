@@ -5,11 +5,12 @@ export interface Item {
   price: number | null;
   image_url: string;
   product_url: string;
-  source: "myntra" | "nykaa" | "manish_malhotra";
+  source: string;
   gender?: ItemGender;
   garment_type?: string | null;
   color?: string | null;
   fabric?: string | null;
   embellishments?: string[];
   currency?: string;
+  available_sizes?: string[];
 }

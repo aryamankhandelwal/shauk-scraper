@@ -2,9 +2,20 @@ import "dotenv/config";
 import { scrapeMyntra } from "./scrapers/myntra";
 import { scrapeNykaa } from "./scrapers/nykaa";
 import { scrapeManish } from "./scrapers/manish";
+import { scrapeShopify } from "./scrapers/shopify";
+import { scrapeJsonLd } from "./scrapers/jsonld";
+import { scrapeAjio } from "./scrapers/ajio";
+import { scrapeTataCliq } from "./scrapers/tatacliq";
+import { scrapePerniasPopup } from "./scrapers/perniaspopup";
+import { scrapeAzaFashions } from "./scrapers/azafashions";
+import { scrapeKalkiFashion } from "./scrapers/kalkifashion";
+import { scrapeFabindia } from "./scrapers/fabindia";
+import { scrapeManyavar } from "./scrapers/manyavar";
 import { supabase } from "./lib/supabase";
 import { Item, ItemGender } from "./types";
 import { extractMetadata } from "./lib/metadata";
+import { SITE_REGISTRY, getShopifySites, getJsonLdSites } from "./scrapers/registry";
+import { ShopifyConfig, JsonLdConfig, PuppeteerConfig } from "./lib/scraper-base";
 
 // Kids signals — filter at ingest time so they never enter the database
 const KIDS_PATTERNS = [
@@ -47,10 +58,6 @@ function classifyForIngest(item: Pick<Item, "title" | "product_url">): "male" | 
   return "unknown";
 }
 
-/**
- * Validates the intended gender tag against signals in the item's title and URL.
- * If the classifier confidently detects the opposite gender, the tag is overridden.
- */
 function validateGender(item: Pick<Item, "title" | "product_url">, intendedGender: ItemGender): ItemGender {
   const detected = classifyForIngest(item);
   if (detected !== "unknown" && detected !== intendedGender) {
@@ -60,25 +67,66 @@ function validateGender(item: Pick<Item, "title" | "product_url">, intendedGende
   return intendedGender;
 }
 
-async function main() {
-  const query = process.argv[2];
-  const genderArg = process.argv[3];
+// ── Puppeteer scraper dispatch ──────────────────────────────────────
 
-  if (!query) {
-    console.error("Usage: npm run ingest -- <query> <gender>");
-    console.error('Example: npm run ingest -- "kurta" male');
-    process.exit(1);
+const PUPPETEER_SCRAPERS: Record<string, (query: string) => Promise<Item[]>> = {
+  myntra: scrapeMyntra,
+  nykaa: scrapeNykaa,
+  manish: () => scrapeManish(),
+  ajio: scrapeAjio,
+  tatacliq: scrapeTataCliq,
+  perniaspopup: scrapePerniasPopup,
+  azafashions: scrapeAzaFashions,
+  kalkifashion: scrapeKalkiFashion,
+  fabindia: scrapeFabindia,
+  manyavar: scrapeManyavar,
+};
+
+// ── Enrichment pipeline ─────────────────────────────────────────────
+
+function enrichItems(items: Item[], defaultGender?: ItemGender): Item[] {
+  return items.map((item) => {
+    const meta = extractMetadata(item.title);
+    const gender = item.gender ?? defaultGender ?? "unisex";
+    return {
+      ...item,
+      gender:         validateGender(item, gender as ItemGender),
+      garment_type:   item.garment_type ?? meta.garmentType,
+      color:          item.color        ?? meta.color,
+      fabric:         item.fabric       ?? meta.fabric,
+      embellishments: [
+        ...(item.embellishments ?? []),
+        ...meta.embellishments.filter(
+          (e) => !(item.embellishments ?? []).includes(e)
+        ),
+      ],
+      currency:       item.currency ?? meta.currency,
+    };
+  });
+}
+
+// ── Upsert to Supabase ──────────────────────────────────────────────
+
+async function upsertItems(items: Item[]): Promise<void> {
+  // Batch in chunks of 500
+  const BATCH_SIZE = 500;
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    // Strip available_sizes — column not yet in DB schema
+    const batch = items.slice(i, i + BATCH_SIZE).map(({ available_sizes: _, ...rest }) => rest);
+    const { error } = await supabase
+      .from("products")
+      .upsert(batch, { onConflict: "product_url" });
+
+    if (error) {
+      console.error(`Supabase upsert failed (batch ${i / BATCH_SIZE + 1}):`, error.message);
+      throw error;
+    }
   }
+}
 
-  if (!genderArg || !["male", "female", "unisex"].includes(genderArg)) {
-    console.error('Gender is required: male | female | unisex');
-    console.error('Example: npm run ingest -- "kurta" male');
-    process.exit(1);
-  }
+// ── Mode: Legacy query-based ingest (existing behavior) ─────────────
 
-  const gender = genderArg as ItemGender;
-
-  // Build a gender-prefixed search so the scrapers hit gendered category pages
+async function ingestByQuery(query: string, gender: ItemGender) {
   const searchQuery =
     gender === "male"
       ? `mens ${query}`
@@ -99,23 +147,7 @@ async function main() {
 
   results.forEach((result, i) => {
     if (result.status === "fulfilled") {
-      const tagged: Item[] = result.value.map((item) => {
-        const meta = extractMetadata(item.title);
-        return {
-          ...item,
-          gender:         validateGender(item, gender),
-          garment_type:   item.garment_type ?? meta.garmentType,
-          color:          item.color        ?? meta.color,
-          fabric:         item.fabric       ?? meta.fabric,
-          embellishments: [
-            ...(item.embellishments ?? []),
-            ...meta.embellishments.filter(
-              (e) => !(item.embellishments ?? []).includes(e)
-            ),
-          ],
-          currency:       item.currency ?? meta.currency,
-        };
-      });
+      const tagged = enrichItems(result.value, gender);
       console.log(`${labels[i]}: ${tagged.length} products`);
       allItems.push(...tagged);
     } else {
@@ -126,11 +158,154 @@ async function main() {
     }
   });
 
-  // Hard-exclude kids products before they touch the database
+  return allItems;
+}
+
+// ── Mode: Registry-based ingest (new) ───────────────────────────────
+
+async function ingestShopifySites(): Promise<Item[]> {
+  const sites = getShopifySites();
+  console.log(`\nScraping ${sites.length} Shopify sites...\n`);
+
+  const allItems: Item[] = [];
+
+  // Run Shopify sites in batches of 5 (no Puppeteer, just HTTP)
+  const CONCURRENCY = 5;
+  for (let i = 0; i < sites.length; i += CONCURRENCY) {
+    const batch = sites.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((site) => scrapeShopify(site as ShopifyConfig))
+    );
+
+    results.forEach((result, j) => {
+      const site = batch[j];
+      if (result.status === "fulfilled") {
+        const enriched = enrichItems(result.value, site.gender);
+        console.log(`  ${site.name}: ${enriched.length} products`);
+        allItems.push(...enriched);
+      } else {
+        console.warn(`  ${site.name}: FAILED — ${result.reason?.message ?? result.reason}`);
+      }
+    });
+  }
+
+  return allItems;
+}
+
+async function ingestJsonLdSites(): Promise<Item[]> {
+  const sites = getJsonLdSites();
+  console.log(`\nScraping ${sites.length} JSON-LD/Shopify sites...\n`);
+
+  const allItems: Item[] = [];
+
+  // Run in batches of 5 (plain HTTP, no browser)
+  const CONCURRENCY = 5;
+  for (let i = 0; i < sites.length; i += CONCURRENCY) {
+    const batch = sites.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((site) => scrapeJsonLd(site as JsonLdConfig))
+    );
+
+    results.forEach((result, j) => {
+      const site = batch[j];
+      if (result.status === "fulfilled") {
+        const enriched = enrichItems(result.value, site.gender);
+        console.log(`  ${site.name}: ${enriched.length} products`);
+        allItems.push(...enriched);
+      } else {
+        console.warn(`  ${site.name}: FAILED — ${result.reason?.message ?? result.reason}`);
+      }
+    });
+  }
+
+  return allItems;
+}
+
+async function ingestPuppeteerSite(config: PuppeteerConfig, query: string): Promise<Item[]> {
+  const scraperFn = PUPPETEER_SCRAPERS[config.scraperId];
+  if (!scraperFn) {
+    console.warn(`[puppeteer] No scraper implemented for "${config.scraperId}" — skipping`);
+    return [];
+  }
+
+  try {
+    const items = await scraperFn(query);
+    const enriched = enrichItems(items, config.gender);
+    console.log(`  ${config.name}: ${enriched.length} products`);
+    return enriched;
+  } catch (err) {
+    console.warn(`  ${config.name}: FAILED — ${(err as Error).message}`);
+    return [];
+  }
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
+async function main() {
+  const mode = process.argv[2];
+
+  let allItems: Item[];
+
+  if (mode === "shopify") {
+    // Ingest Shopify sites + JSON-LD sites (both use plain HTTP, no browser)
+    const [shopifyItems, jsonldItems] = await Promise.all([
+      ingestShopifySites(),
+      ingestJsonLdSites(),
+    ]);
+    allItems = [...shopifyItems, ...jsonldItems];
+
+  } else if (mode === "all") {
+    // Ingest all sites from registry
+    console.log("=== INGESTING ALL SITES ===\n");
+
+    // Phase 1: Shopify + JSON-LD (fast, plain HTTP, run concurrently)
+    const [shopifyItems, jsonldItems] = await Promise.all([
+      ingestShopifySites(),
+      ingestJsonLdSites(),
+    ]);
+
+    // Phase 2: Puppeteer marketplaces (need browser, run sequentially)
+    console.log(`\nScraping Puppeteer marketplace sites...\n`);
+    const puppeteerItems: Item[] = [];
+    const puppeteerSites = SITE_REGISTRY.filter(
+      (s): s is PuppeteerConfig => s.type === "puppeteer"
+    );
+    for (const site of puppeteerSites) {
+      const items = await ingestPuppeteerSite(site, "ethnic wear");
+      puppeteerItems.push(...items);
+    }
+
+    allItems = [...shopifyItems, ...jsonldItems, ...puppeteerItems];
+
+  } else {
+    // Legacy mode: query + gender
+    const query = mode;
+    const genderArg = process.argv[3];
+
+    if (!query) {
+      console.error("Usage:");
+      console.error('  npm run ingest -- <query> <gender>     (legacy mode)');
+      console.error('  npm run ingest -- shopify               (all Shopify sites)');
+      console.error('  npm run ingest -- all                   (all registry sites)');
+      process.exit(1);
+    }
+
+    if (!genderArg || !["male", "female", "unisex"].includes(genderArg)) {
+      console.error('Gender is required: male | female | unisex');
+      console.error('Example: npm run ingest -- "kurta" male');
+      process.exit(1);
+    }
+
+    allItems = await ingestByQuery(query, genderArg as ItemGender);
+  }
+
+  // ── Post-processing pipeline ────────────────────────────────────
+
+  // Hard-exclude kids products
   const adults = allItems.filter((item) => !isKidsProduct(item));
   const kidsCount = allItems.length - adults.length;
   if (kidsCount > 0) {
-    console.log(`Excluded ${kidsCount} kids product(s).`);
+    console.log(`\nExcluded ${kidsCount} kids product(s).`);
   }
 
   if (adults.length === 0) {
@@ -144,18 +319,13 @@ async function main() {
     unique.set(item.product_url, item);
   }
   const items = Array.from(unique.values());
-
-  console.log(`Upserting ${items.length} unique products to Supabase...`);
-
-  const { error } = await supabase
-    .from("products")
-    .upsert(items, { onConflict: "product_url" });
-
-  if (error) {
-    console.error("Supabase upsert failed:", error.message);
-    process.exit(1);
+  const dupeCount = adults.length - items.length;
+  if (dupeCount > 0) {
+    console.log(`Removed ${dupeCount} duplicate(s).`);
   }
 
+  console.log(`\nUpserting ${items.length} unique products to Supabase...`);
+  await upsertItems(items);
   console.log(`Done. ${items.length} products inserted/updated.`);
 }
 

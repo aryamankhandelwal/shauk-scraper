@@ -2,10 +2,14 @@ import "dotenv/config";
 import { execSync } from "child_process";
 
 /**
- * Catalog of all query+gender combinations to ingest.
- * Add a new entry here whenever you want to support a new garment type.
+ * Seed script — runs ingestion across all sources.
+ *
+ * Phase 1: Shopify sites via registry (fast, no Puppeteer)
+ * Phase 2: Legacy query+gender pairs via Puppeteer marketplace scrapers
  */
-const CATALOG: { query: string; gender: "male" | "female" | "unisex" }[] = [
+
+// Legacy catalog for Puppeteer-based marketplace scrapers (Myntra, Nykaa, Manish)
+const MARKETPLACE_CATALOG: { query: string; gender: "male" | "female" | "unisex" }[] = [
   // Men's
   { query: "kurta", gender: "male" },
   { query: "sherwani", gender: "male" },
@@ -24,9 +28,21 @@ const CATALOG: { query: string; gender: "male" | "female" | "unisex" }[] = [
 ];
 
 async function main() {
-  console.log(`Seeding ${CATALOG.length} query+gender combinations...\n`);
+  console.log("=== SEED: PHASE 1 — Shopify Sites ===\n");
 
-  for (const { query, gender } of CATALOG) {
+  try {
+    execSync("npm run ingest -- shopify", {
+      stdio: "inherit",
+      cwd: process.cwd(),
+    });
+  } catch {
+    console.warn("⚠ Shopify ingest had errors — continuing\n");
+  }
+
+  console.log("\n=== SEED: PHASE 2 — Marketplace Queries ===\n");
+  console.log(`Running ${MARKETPLACE_CATALOG.length} query+gender combinations...\n`);
+
+  for (const { query, gender } of MARKETPLACE_CATALOG) {
     console.log(`▶ ${query} (${gender})`);
     try {
       execSync(`npm run ingest -- "${query}" ${gender}`, {
