@@ -1,9 +1,10 @@
 import { Item } from "../types";
-import { JsonLdConfig } from "../lib/scraper-base";
+import { JsonLdConfig, normalizeSize } from "../lib/scraper-base";
 
 // ── Shopify types (subset) ────────────────────────────────────────────
 
 interface ShopifyVariant {
+  title: string;
   price: string;
   available: boolean;
 }
@@ -31,39 +32,57 @@ interface JsonLdProduct {
   offers?: JsonLdOffer | JsonLdOffer[];
 }
 
+// ── Constants ─────────────────────────────────────────────────────────
+
+const PER_PAGE = 250;
+
+const FETCH_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  Accept: "application/json",
+};
+
 // ── Main entry point ──────────────────────────────────────────────────
 
 /**
  * Scraper for "jsonld" type sites — all of which are Shopify stores.
  * Strategy:
- *   1. Try the Shopify /products.json endpoint (fast, no browser)
+ *   1. Try the Shopify /products.json endpoint (fast, paginated)
  *   2. Fall back to fetching collection pages and parsing JSON-LD <script> tags
  */
 export async function scrapeJsonLd(config: JsonLdConfig): Promise<Item[]> {
   const maxItems = config.maxItems ?? 20;
-  const domain = new URL(config.collectionUrls[0]).origin; // e.g. https://www.rawmango.in
+  const domain = new URL(config.collectionUrls[0]).origin;
 
   console.log(`[jsonld:${config.name}] Trying Shopify /products.json...`);
 
-  // Phase 1: Try Shopify /products.json
+  // Phase 1: Try Shopify /products.json with pagination
   try {
-    const url = `${domain}/products.json?limit=${Math.min(maxItems + 10, 250)}`;
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
+    const items: Item[] = [];
+    let page = 1;
 
-    if (res.ok) {
+    while (items.length < maxItems) {
+      const url = `${domain}/products.json?limit=${PER_PAGE}&page=${page}`;
+      const res = await fetch(url, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!res.ok) break;
+
       const data = (await res.json()) as { products?: ShopifyProduct[] };
-      if (data.products?.length) {
-        const items = mapShopifyProducts(data.products, domain, config.name, maxItems);
-        console.log(`[jsonld:${config.name}] Shopify: ${items.length} products`);
-        return items;
-      }
+      if (!data.products?.length) break;
+
+      const mapped = mapShopifyProducts(data.products, domain, config.name, maxItems - items.length);
+      items.push(...mapped);
+
+      if (data.products.length < PER_PAGE) break;
+      page++;
+    }
+
+    if (items.length > 0) {
+      console.log(`[jsonld:${config.name}] Shopify: ${items.length} products`);
+      return items;
     }
   } catch {
     // Fall through to JSON-LD
@@ -100,6 +119,8 @@ function mapShopifyProducts(
     const price = priceStr ? parseFloat(priceStr) : null;
     const imageUrl = p.images[0].src.replace(/\?.*$/, "");
 
+    const availableSizes = extractSizes(p.variants ?? []);
+
     items.push({
       title: p.title,
       price: price && price > 0 ? price : null,
@@ -107,10 +128,27 @@ function mapShopifyProducts(
       product_url: `${domain}/products/${p.handle}`,
       source,
       garment_type: p.product_type || null,
+      available_sizes: availableSizes.length > 0 ? availableSizes : undefined,
       currency: "INR",
     });
   }
   return items;
+}
+
+function extractSizes(variants: ShopifyVariant[]): string[] {
+  const sizes: string[] = [];
+  const seen = new Set<string>();
+
+  for (const v of variants) {
+    if (!v.available) continue;
+    const normalized = normalizeSize(v.title);
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      sizes.push(normalized);
+    }
+  }
+
+  return sizes;
 }
 
 async function scrapeViaJsonLd(
@@ -134,7 +172,6 @@ async function scrapeViaJsonLd(
     return [];
   }
 
-  // Extract all <script type="application/ld+json"> blocks
   const scriptRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   const items: Item[] = [];
   let match: RegExpExecArray | null;
@@ -147,7 +184,6 @@ async function scrapeViaJsonLd(
       continue;
     }
 
-    // Handle single object or array
     const schemas = Array.isArray(data) ? data : [data];
 
     for (const schema of schemas) {
@@ -181,9 +217,7 @@ async function scrapeViaJsonLd(
   return items;
 }
 
-function extractImageUrl(
-  image: JsonLdProduct["image"]
-): string | null {
+function extractImageUrl(image: JsonLdProduct["image"]): string | null {
   if (!image) return null;
   if (typeof image === "string") return image;
   if (Array.isArray(image)) {

@@ -45,6 +45,8 @@ const GENDER_FEMALE_PATTERNS = [
   /\bsaree\b/, /\bsari\b/, /\banarkali\b/, /\bsalwar\b/, /\bdupatta\b/,
   /\bstraight\s+kurta\b/, /\bpalazzo\b/, /\ba[\s-]line\b/, /\bpeplum\b/, /\bkurta\s+pant\b/,
   /\bkurta\s+set\b/, /\bsharara\b/, /\bgharara\b/,
+  // SYNC: keep aligned with shauk-api/app/api/lib/classifier.ts
+  /\bkurta\b/,
 ];
 const GENDER_MALE_URL_SEGMENTS = ["/men/", "/men-", "-men/", "/menswear", "/mens/"];
 const GENDER_FEMALE_URL_SEGMENTS = ["/women/", "/women-", "-women/", "/womenswear", "/womens/"];
@@ -112,8 +114,7 @@ async function upsertItems(items: Item[]): Promise<void> {
   // Batch in chunks of 500
   const BATCH_SIZE = 500;
   for (let i = 0; i < items.length; i += BATCH_SIZE) {
-    // Strip available_sizes — column not yet in DB schema
-    const batch = items.slice(i, i + BATCH_SIZE).map(({ available_sizes: _, ...rest }) => rest);
+    const batch = items.slice(i, i + BATCH_SIZE);
     const { error } = await supabase
       .from("products")
       .upsert(batch, { onConflict: "product_url" });
@@ -328,13 +329,33 @@ async function main() {
     process.exit(0);
   }
 
-  // Deduplicate by product_url
+  // Image URL dedup within same source (catches same-photo different-SKU variants)
+  const imageDeduped = (() => {
+    const seen = new Map<string, Item>();
+    for (const item of adults) {
+      if (!item.image_url) { seen.set(item.product_url, item); continue; }
+      const rawKey = item.image_url.split("?")[0]
+        .replace(/_([\d]+x[\d]*|x[\d]+|grande|large|medium|small|compact|master|thumb|icon|pico|nano)(?=\.\w{3,4}$)/i, "")
+        .toLowerCase();
+      const key = `${rawKey}||${item.source}`;
+      const ex = seen.get(key);
+      if (!ex) { seen.set(key, item); continue; }
+      const scoreA = (ex.garment_type!=null?1:0)+(ex.color!=null?1:0)+(ex.fabric!=null?1:0);
+      const scoreB = (item.garment_type!=null?1:0)+(item.color!=null?1:0)+(item.fabric!=null?1:0);
+      if (scoreB > scoreA) seen.set(key, item);
+    }
+    return Array.from(seen.values());
+  })();
+  const imgDupCount = adults.length - imageDeduped.length;
+  if (imgDupCount > 0) console.log(`Removed ${imgDupCount} image duplicate(s).`);
+
+  // Deduplicate by product_url (safety net)
   const unique = new Map<string, Item>();
-  for (const item of adults) {
+  for (const item of imageDeduped) {
     unique.set(item.product_url, item);
   }
   const items = Array.from(unique.values());
-  const dupeCount = adults.length - items.length;
+  const dupeCount = imageDeduped.length - items.length;
   if (dupeCount > 0) {
     console.log(`Removed ${dupeCount} duplicate(s).`);
   }
